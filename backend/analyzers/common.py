@@ -830,7 +830,7 @@ def safe_extract_zip(
         for entry_name in safe_entries:
             # Re-verify path safety under resolved destination
             target_path = (destination_dir / entry_name).resolve()
-            if not str(target_path).startswith(str(destination_dir)):
+            if not target_path.is_relative_to(destination_dir):
                 raise ValueError(f"Path traversal detected during extraction: {entry_name}")
 
             target_path.parent.mkdir(parents=True, exist_ok=True)
