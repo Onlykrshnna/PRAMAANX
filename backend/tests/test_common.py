@@ -421,6 +421,29 @@ def test_zip_safety_dangerous_executable_entry():
     assert any("Executable / Dangerous File" in f.title for f in findings)
 
 
+def test_zip_safety_suspicious_compression_ratio():
+    """Flags archives containing members with abnormal compression ratios (>10:1)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("ratio_bomb.txt", b"\x00" * 1_000_000)
+    buf.seek(0)
+
+    is_safe, findings, safe_entries = validate_zip_safety(buf)
+    assert any("Compression Ratio" in f.title for f in findings)
+
+
+def test_zip_safety_total_uncompressed_limit():
+    """Rejects archives exceeding total uncompressed limit of 100 MB."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("bomb_105mb.txt", b"\x00" * (105 * 1024 * 1024))
+    buf.seek(0)
+
+    is_safe, findings, safe_entries = validate_zip_safety(buf)
+    assert is_safe is False
+    assert any("Decompression Bomb" in f.title or "Compression Ratio" in f.title for f in findings)
+
+
 def test_safe_extract_zip(tmp_path: Path):
     """Verifies that safe_extract_zip unpacks safe entries to the destination directory."""
     zip_path = tmp_path / "valid.zip"
