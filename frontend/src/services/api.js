@@ -154,13 +154,35 @@ export const getReportDetail = (reportId) => {
   return apiClient.get(`/reports/${reportId}`);
 };
 
+export const resolveMediaUrl = (path) => {
+  if (!path) return null;
+  if (
+    path.startsWith('http://') ||
+    path.startsWith('https://') ||
+    path.startsWith('blob:') ||
+    path.startsWith('data:')
+  ) {
+    return path;
+  }
+  const base = import.meta.env.VITE_API_BASE_URL || '';
+  if (base.startsWith('http')) {
+    try {
+      const origin = new URL(base).origin;
+      return `${origin}${path.startsWith('/') ? '' : '/'}${path}`;
+    } catch {
+      return path;
+    }
+  }
+  return path;
+};
+
 export const getReportDownloadUrl = (reportId) => {
-  const baseURL = apiClient.defaults.baseURL || 'http://localhost:8000/api/v1';
+  const baseURL = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/+$/, '');
   return `${baseURL}/reports/${reportId}/download`;
 };
 
 export const getReportPreviewUrl = (reportId) => {
-  const baseURL = apiClient.defaults.baseURL || 'http://localhost:8000/api/v1';
+  const baseURL = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/+$/, '');
   return `${baseURL}/reports/${reportId}/preview`;
 };
 

@@ -13,6 +13,7 @@ import TechnicalTab from './TechnicalTab';
 import PipelineTab from './PipelineTab';
 import { getAiAssessment, getFileSpecificChecklist, getPlainEnglishVerdict } from '../../utils/explainabilityHelpers';
 import { buildMetadataReport } from '../../utils/metadataHelpers';
+import { resolveMediaUrl } from '../../services/api';
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
@@ -83,7 +84,9 @@ export default function ForensicResults({
   }
 
   // Unified original specimen URL (prefers persistent backend endpoint, falls back to memory blob)
-  const resolvedOriginalUrl = analysis?.visual_evidence?.original_url || filePreview || null;
+  const resolvedOriginalUrl = resolveMediaUrl(analysis?.visual_evidence?.original_url) || filePreview || null;
+  const resolvedGradcamUrl = resolveMediaUrl(analysis?.visual_evidence?.gradcam_url);
+  const resolvedElaUrl = resolveMediaUrl(analysis?.visual_evidence?.ela_url);
 
   return (
     <div className="space-y-8">
@@ -144,8 +147,8 @@ export default function ForensicResults({
         {activeTab === 'visual' && (
           <VisualEvidenceTab
             originalUrl={resolvedOriginalUrl}
-            gradcamUrl={analysis.visual_evidence?.gradcam_url}
-            elaUrl={analysis.visual_evidence?.ela_url}
+            gradcamUrl={resolvedGradcamUrl}
+            elaUrl={resolvedElaUrl}
             elaStats={
               analysis.findings?.find((f) => (f.title || '').includes('ELA'))?.evidence ||
               analysis.metadata?.ela_stats

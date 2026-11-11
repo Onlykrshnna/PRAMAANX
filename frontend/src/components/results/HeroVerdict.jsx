@@ -12,6 +12,7 @@ import Gauge from '../common/Gauge';
 import InteractiveImageOverlay from './InteractiveImageOverlay';
 import SignalChip from '../common/SignalChip';
 import Button from '../common/Button';
+import { resolveMediaUrl } from '../../services/api';
 import {
   FileText,
   Download,
@@ -33,9 +34,9 @@ export default function HeroVerdict({
   const [showReliabilityTooltip, setShowReliabilityTooltip] = useState(false);
 
   const riskScore = analysis?.risk_score ?? 0;
-  const originalUrl = analysis?.visual_evidence?.original_url || filePreview || null;
-  const gradcamUrl = analysis?.visual_evidence?.gradcam_url || null;
-  const elaUrl = analysis?.visual_evidence?.ela_url || null;
+  const originalUrl = resolveMediaUrl(analysis?.visual_evidence?.original_url) || filePreview || null;
+  const gradcamUrl = resolveMediaUrl(analysis?.visual_evidence?.gradcam_url) || null;
+  const elaUrl = resolveMediaUrl(analysis?.visual_evidence?.ela_url) || null;
   const reliability = analysis?.reliability || 'high';
 
   // 4-state verdict derivation

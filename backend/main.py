@@ -59,7 +59,7 @@ from backend.analyzers.common import (
 )
 from backend.analyzers.image import MODEL_PATH as IMAGE_MODEL_PATH
 from backend.analyzers.malpdf import MODEL_PATH as PDF_XGB_MODEL_PATH
-from backend.database import init_db
+from backend.database import check_db_health, init_db
 from backend.pipeline import ForensicPipeline
 from backend.routes.investigations import router as investigations_router
 from backend.routes.reports import reports_router
@@ -197,10 +197,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Configure CORS origins from environment variable or defaults
+raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+if raw_origins:
+    allowed_origins = [orig.strip() for orig in raw_origins.split(",") if orig.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+is_wildcard = "*" in allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins if not is_wildcard else ["*"],
+    allow_origin_regex=r"https:\/\/.*\.vercel\.app" if not is_wildcard else None,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -458,6 +473,7 @@ def health_check():
     return {
         "status": "healthy",
         "engine": "pramaanx-core",
+        "database": check_db_health(),
         "phase1_subsystems": {
             "sha256": "active",
             "magic_bytes": "active",
@@ -467,6 +483,12 @@ def health_check():
             "noisy_or_scoring": "active",
         },
     }
+
+
+@app.get("/api/v1/health/db", tags=["Health"])
+def api_v1_health_db():
+    """Database connectivity, latency, and metrics health probe."""
+    return check_db_health()
 
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["Health"])
@@ -868,6 +890,22 @@ def get_visual_evidence(
         evidence_file = candidate_evidence
     elif candidate_temp.is_relative_to(UPLOAD_TEMP_DIR.resolve()) and candidate_temp.is_file():
         evidence_file = candidate_temp
+    else:
+        # Ephemeral disk recovery: attempt retrieval from Supabase Storage
+        from backend.storage import (
+            BUCKET_ARTIFACTS,
+            BUCKET_EVIDENCE,
+            download_from_storage,
+            is_supabase_storage_enabled,
+        )
+        if is_supabase_storage_enabled():
+            bucket = BUCKET_EVIDENCE if evidence_type == "original" else BUCKET_ARTIFACTS
+            content = download_from_storage(bucket, filename)
+            if content:
+                dest = (EVIDENCE_DIR if evidence_type == "original" else ARTIFACTS_DIR) / filename
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content)
+                evidence_file = dest
 
     if not evidence_file:
         raise HTTPException(

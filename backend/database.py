@@ -1,35 +1,40 @@
 """
-PRAMAANX - Persistence & Forensic Evidence Vault Database (Milestone D)
-=======================================================================
-Provides a reliable local-first SQLite relational persistence layer for:
-- Investigation (Case) lifecycle management (create, search, filter, reopen, archive)
+PRAMAANX - Persistence & Forensic Evidence Vault Database
+=========================================================
+Dual-mode enterprise persistence layer supporting:
+1. Supabase PostgreSQL (Cloud production & networked deployment)
+2. Local SQLite (WAL-mode local development & offline fallback)
+
+Features:
+- Thread-safe connection pooling
+- Seamless transparent query translation (? to %s for PostgreSQL)
 - Immutable evidence item registry and physical vault storage
+- Integrated Supabase Storage support for private cloud buckets
 - Historic analysis examination records (never overwriting prior results)
 - Cryptographic hash re-verification and tamper detection
 - Auditable forensic activity logging
-
-Security Guarantees:
---------------------
-1. Zero Silent Overwrite: Every ingestion or analysis run creates a distinct,
-   traceable record.
-2. Read-Only Protection: Evidence binaries in the vault are marked read-only on disk
-   to prevent accidental modification.
-3. Path Traversal Defense: Filenames are sanitized and storage paths are strictly
-   contained within configured vault directories.
-4. Auditable Activity: Key events (case creation, ingestion, analysis, hash verification)
-   are committed to the immutable audit trail.
+- Database health check and diagnostic monitoring
 """
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import time
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import uuid
+
+from dotenv import load_dotenv
+
+# Load backend environment variables if present
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.is_file():
+    load_dotenv(dotenv_path=_env_path)
 
 from backend.config import (
     ARTIFACTS_DIR,
@@ -39,6 +44,54 @@ from backend.config import (
     VAULT_DIR,
 )
 from backend.analyzers.common import compute_sha256, detect_magic_bytes
+from backend.storage import (
+    BUCKET_ARTIFACTS,
+    BUCKET_EVIDENCE,
+    download_from_storage,
+    is_supabase_storage_enabled,
+    upload_to_storage,
+)
+
+logger = logging.getLogger("pramaanx.database")
+
+# Check Supabase Database configuration
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+
+# PostgreSQL driver imports
+_pg_pool = None
+_use_postgres = False
+
+if SUPABASE_DB_URL:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        import psycopg2.pool
+
+        # Initialize connection pool (1 to 10 connections)
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=SUPABASE_DB_URL,
+            connect_timeout=10,
+        )
+        _use_postgres = True
+        logger.info("Connected to Supabase PostgreSQL connection pool.")
+    except Exception as exc:
+        logger.warning(
+            f"Failed to connect to Supabase PostgreSQL ({exc}). Falling back to local SQLite."
+        )
+        _pg_pool = None
+        _use_postgres = False
+
+
+_ORIGINAL_DB_PATH = Path(DB_PATH)
+
+def _should_use_postgres() -> bool:
+    """
+    Returns True only if Supabase PostgreSQL is configured AND
+    DB_PATH has not been redirected/monkeypatched for isolated testing.
+    """
+    return bool(_use_postgres and _pg_pool and Path(DB_PATH) == _ORIGINAL_DB_PATH)
 
 
 def _get_utc_now() -> str:
@@ -46,24 +99,203 @@ def _get_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_parse_json(val: Any, default: Any) -> Any:
+    """Safely handles JSON deserialization for both TEXT (SQLite) and JSONB (PostgreSQL)."""
+    if val is None:
+        return default
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, ValueError):
+            return default
+    return default
+
+
+def _format_timestamp(val: Any) -> str:
+    """Ensures timestamp is returned as ISO 8601 string across both engines."""
+    if val is None:
+        return ""
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return str(val)
+
+
+def get_active_db_engine() -> str:
+    """Returns 'postgresql' if connected to Supabase, else 'sqlite'."""
+    return "postgresql" if _should_use_postgres() else "sqlite"
+
+
+class PgCursorWrapper:
+    """
+    Wraps a psycopg2 cursor to provide uniform parameter syntax (?)
+    and dictionary-like row access compatible with sqlite3.Row.
+    """
+
+    def __init__(self, raw_cursor):
+        self._cur = raw_cursor
+
+    def execute(self, query: str, params: Any = None):
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        pg_query = query.replace("?", "%s")
+        if params is not None:
+            # Convert list params to tuple if necessary
+            if isinstance(params, list):
+                params = tuple(params)
+            return self._cur.execute(pg_query, params)
+        return self._cur.execute(pg_query)
+
+    def executemany(self, query: str, seq_of_parameters):
+        pg_query = query.replace("?", "%s")
+        return self._cur.executemany(pg_query, seq_of_parameters)
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def fetchmany(self, size: Optional[int] = None):
+        return self._cur.fetchmany(size) if size else self._cur.fetchmany()
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, "lastrowid", None)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class PgConnectionWrapper:
+    """Wraps a psycopg2 connection to yield PgCursorWrapper and handle pooling."""
+
+    def __init__(self, raw_conn, pool=None):
+        self._conn = raw_conn
+        self._pool = pool
+
+    def cursor(self):
+        import psycopg2.extras
+        return PgCursorWrapper(
+            self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        )
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        if self._pool:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                pass
+        else:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def execute(self, query: str, params: Any = None):
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @contextmanager
-def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
+def get_db_connection() -> Generator[Any, None, None]:
     """
-    Context manager yielding a thread-safe SQLite connection with WAL mode,
-    foreign key enforcement, and dictionary row access.
+    Context manager yielding a thread-safe connection with dictionary-like row access.
+    Automatically connects to Supabase PostgreSQL if configured, or falls back to SQLite.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
-    conn.row_factory = sqlite3.Row
+    global _pg_pool, _use_postgres
+
+    if _should_use_postgres():
+        raw_conn = None
+        try:
+            raw_conn = _pg_pool.getconn()
+            wrapper = PgConnectionWrapper(raw_conn, pool=_pg_pool)
+            yield wrapper
+            wrapper.commit()
+        except Exception:
+            if raw_conn:
+                try:
+                    raw_conn.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if raw_conn and _pg_pool:
+                try:
+                    _pg_pool.putconn(raw_conn)
+                except Exception:
+                    pass
+    else:
+        # SQLite connection
+        conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def check_db_health() -> Dict[str, Any]:
+    """
+    Diagnostic probe that verifies database connectivity, measures query latency,
+    and returns engine metrics.
+    """
+    start_time = time.perf_counter()
+    engine = get_active_db_engine()
+
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 AS alive;")
+            row = cursor.fetchone()
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+
+            cursor.execute("SELECT COUNT(*) AS cnt FROM investigations;")
+            inv_cnt = cursor.fetchone()["cnt"]
+
+            cursor.execute("SELECT COUNT(*) AS cnt FROM evidence_items;")
+            evi_cnt = cursor.fetchone()["cnt"]
+
+            return {
+                "status": "healthy",
+                "engine": engine,
+                "latency_ms": round(latency_ms, 2),
+                "timestamp": _get_utc_now(),
+                "metrics": {
+                    "investigations_count": inv_cnt,
+                    "evidence_items_count": evi_cnt,
+                    "storage_integration": is_supabase_storage_enabled(),
+                },
+            }
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        return {
+            "status": "unhealthy",
+            "engine": engine,
+            "latency_ms": round(latency_ms, 2),
+            "timestamp": _get_utc_now(),
+            "error": str(exc),
+        }
 
 
 def init_db() -> None:
@@ -76,6 +308,19 @@ def init_db() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    if _should_use_postgres():
+        # Schema migration on PostgreSQL is executed explicitly via migration runner
+        # or when AUTO_APPLY_MIGRATIONS=true. Do not auto-execute unapproved DDL.
+        if os.getenv("AUTO_APPLY_MIGRATIONS", "").lower() in ("true", "1"):
+            migration_file = Path(__file__).resolve().parent / "migrations" / "001_initial_supabase_schema.sql"
+            if migration_file.is_file():
+                sql = migration_file.read_text(encoding="utf-8")
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql)
+        return
+
+    # SQLite Schema Initialization
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -107,6 +352,8 @@ def init_db() -> None:
                 acquired_at TEXT NOT NULL,
                 integrity_status TEXT DEFAULT 'verified',
                 last_verified_at TEXT,
+                storage_bucket TEXT DEFAULT 'pramaanx_evidence',
+                storage_path TEXT,
                 FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE
             );
         """)
@@ -146,7 +393,7 @@ def init_db() -> None:
             );
         """)
 
-        # 5. Forensic Reports Table (Milestone E)
+        # 5. Forensic Reports Table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS reports (
                 id TEXT PRIMARY KEY,
@@ -160,6 +407,8 @@ def init_db() -> None:
                 included_records_json TEXT NOT NULL DEFAULT '[]',
                 generated_by TEXT DEFAULT 'Forensic Analyst',
                 created_at TEXT NOT NULL,
+                storage_bucket TEXT DEFAULT 'pramaanx_artifacts',
+                storage_path TEXT,
                 FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE
             );
         """)
@@ -243,7 +492,9 @@ def get_investigation(case_id: str) -> Optional[Dict[str, Any]]:
             return None
 
         case_dict = dict(row)
-        case_dict["tags"] = json.loads(case_dict["tags"] or "[]")
+        case_dict["tags"] = _safe_parse_json(case_dict.get("tags"), [])
+        case_dict["created_at"] = _format_timestamp(case_dict.get("created_at"))
+        case_dict["updated_at"] = _format_timestamp(case_dict.get("updated_at"))
 
         # Aggregate evidence item count
         cursor.execute("SELECT COUNT(*) AS cnt FROM evidence_items WHERE investigation_id = ?;", (case_id,))
@@ -290,7 +541,7 @@ def list_investigations(
         query += " AND (LOWER(i.id) LIKE ? OR LOWER(i.title) LIKE ? OR LOWER(i.description) LIKE ? OR LOWER(i.investigator) LIKE ?)"
         params.extend([term, term, term, term])
 
-    count_query = f"SELECT COUNT(*) as total FROM ({query})"
+    count_query = f"SELECT COUNT(*) as total FROM ({query}) AS _count_sub"
 
     safe_limit = limit if isinstance(limit, int) else 50
     safe_offset = offset if isinstance(offset, int) else 0
@@ -308,7 +559,9 @@ def list_investigations(
         results = []
         for r in rows:
             d = dict(r)
-            d["tags"] = json.loads(d["tags"] or "[]")
+            d["tags"] = _safe_parse_json(d.get("tags"), [])
+            d["created_at"] = _format_timestamp(d.get("created_at"))
+            d["updated_at"] = _format_timestamp(d.get("updated_at"))
             d["highest_risk_score"] = d["highest_risk_score"] if d["highest_risk_score"] is not None else 0
             results.append(d)
 
@@ -400,14 +653,7 @@ def store_evidence_file(
     actor: str = "Analyst",
 ) -> Dict[str, Any]:
     """
-    Ingests an evidence binary into the evidence vault directory.
-    
-    Security:
-    - Verifies parent case exists.
-    - Writes file atomically into `EVIDENCE_DIR`.
-    - Generates immutable SHA-256 hash.
-    - Strips write permissions where supported (read-only protection).
-    - Records audit log entry.
+    Ingests an evidence binary into the evidence vault directory and optionally Supabase Storage.
     """
     case = get_investigation(investigation_id)
     if not case:
@@ -418,7 +664,7 @@ def store_evidence_file(
     stored_filename = f"{evidence_id}_{safe_name}"
     stored_path = EVIDENCE_DIR / stored_filename
 
-    # Write file to vault
+    # Write file to local disk vault
     stored_path.write_bytes(file_bytes)
 
     # Protect file integrity: strip write permission (make read-only)
@@ -432,6 +678,13 @@ def store_evidence_file(
     magic = detect_magic_bytes(file_bytes)
     now = _get_utc_now()
 
+    storage_bucket = BUCKET_EVIDENCE
+    storage_path = f"{investigation_id}/{stored_filename}"
+
+    # Upload to Supabase Storage if enabled
+    if is_supabase_storage_enabled():
+        upload_to_storage(storage_bucket, storage_path, file_bytes, content_type=magic.detected_mime)
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -439,8 +692,8 @@ def store_evidence_file(
             INSERT INTO evidence_items (
                 id, investigation_id, original_filename, file_size_bytes, sha256,
                 detected_mime, detected_ext, stored_filename, acquired_at,
-                integrity_status, last_verified_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?);
+                integrity_status, last_verified_at, storage_bucket, storage_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?);
             """,
             (
                 evidence_id,
@@ -453,6 +706,8 @@ def store_evidence_file(
                 stored_filename,
                 now,
                 now,
+                storage_bucket,
+                storage_path,
             ),
         )
 
@@ -471,6 +726,7 @@ def store_evidence_file(
                     "sha256": sha256_hash,
                     "size_bytes": file_size,
                     "detected_mime": magic.detected_mime,
+                    "storage_path": storage_path,
                 }),
             ),
         )
@@ -489,6 +745,9 @@ def get_evidence_item(evidence_id: str) -> Optional[Dict[str, Any]]:
         d = dict(row)
         stored_path = EVIDENCE_DIR / d["stored_filename"]
         d["file_exists_on_disk"] = stored_path.is_file()
+        d["acquired_at"] = _format_timestamp(d.get("acquired_at"))
+        if d.get("last_verified_at"):
+            d["last_verified_at"] = _format_timestamp(d["last_verified_at"])
         return d
 
 
@@ -497,13 +756,21 @@ def get_evidence_file_path(evidence_id: str) -> Path:
     item = get_evidence_item(evidence_id)
     if not item:
         raise FileNotFoundError(f"Evidence record '{evidence_id}' not found.")
-    
+
     safe_path = (EVIDENCE_DIR / item["stored_filename"]).resolve()
     # Confirm path stays strictly inside EVIDENCE_DIR
     if not str(safe_path).startswith(str(EVIDENCE_DIR.resolve())):
         raise PermissionError("Path traversal violation attempting to escape evidence vault.")
 
     if not safe_path.is_file():
+        # Ephemeral disk recovery: pull from Supabase Storage if available
+        if is_supabase_storage_enabled() and item.get("storage_path"):
+            bucket = item.get("storage_bucket") or BUCKET_EVIDENCE
+            content = download_from_storage(bucket, item["storage_path"])
+            if content:
+                safe_path.parent.mkdir(parents=True, exist_ok=True)
+                safe_path.write_bytes(content)
+                return safe_path
         raise FileNotFoundError(f"Evidence file for record '{evidence_id}' is missing from vault.")
 
     return safe_path
@@ -536,7 +803,7 @@ def list_evidence_items(
         query += " AND (LOWER(e.original_filename) LIKE ? OR LOWER(e.sha256) LIKE ? OR LOWER(e.id) LIKE ? OR LOWER(i.title) LIKE ?)"
         params.extend([term, term, term, term])
 
-    count_query = f"SELECT COUNT(*) as total FROM ({query})"
+    count_query = f"SELECT COUNT(*) as total FROM ({query}) AS _count_sub"
 
     safe_limit = limit if isinstance(limit, int) else 50
     safe_offset = offset if isinstance(offset, int) else 0
@@ -551,7 +818,13 @@ def list_evidence_items(
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
-        results = [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["acquired_at"] = _format_timestamp(d.get("acquired_at"))
+            if d.get("last_verified_at"):
+                d["last_verified_at"] = _format_timestamp(d["last_verified_at"])
+            results.append(d)
         return results, total
 
 
@@ -559,9 +832,6 @@ def verify_evidence_integrity(evidence_id: str, actor: str = "Analyst") -> Dict[
     """
     Recalculates cryptographic SHA-256 hash of the stored evidence binary on disk
     and verifies it against the acquisition baseline.
-    
-    Detects unauthorized modification, byte alteration, or file loss.
-    Records audit entry with verification outcome.
     """
     item = get_evidence_item(evidence_id)
     if not item:
@@ -658,6 +928,14 @@ def create_analysis_record(
             dest = ARTIFACTS_DIR / dest_name
             shutil.copyfile(src, dest)
             persistent_visuals[key] = f"/api/v1/evidence/{key}/{dest_name}"
+
+            if is_supabase_storage_enabled():
+                upload_to_storage(
+                    BUCKET_ARTIFACTS,
+                    f"{investigation_id}/{dest_name}",
+                    dest.read_bytes(),
+                    content_type="image/png",
+                )
         elif isinstance(path_str, str) and path_str.startswith("/api/v1/"):
             persistent_visuals[key] = path_str
 
@@ -730,9 +1008,10 @@ def get_analysis_record(analysis_id: str) -> Optional[Dict[str, Any]]:
             return None
 
         d = dict(row)
-        d["findings"] = json.loads(d["findings_json"] or "[]")
-        d["metadata_timeline"] = json.loads(d["metadata_timeline_json"] or "[]")
-        d["visual_evidence"] = json.loads(d["visual_evidence_json"] or "{}")
+        d["findings"] = _safe_parse_json(d.get("findings_json"), [])
+        d["metadata_timeline"] = _safe_parse_json(d.get("metadata_timeline_json"), [])
+        d["visual_evidence"] = _safe_parse_json(d.get("visual_evidence_json"), {})
+        d["analyzed_at"] = _format_timestamp(d.get("analyzed_at"))
         return d
 
 
@@ -752,9 +1031,10 @@ def list_analysis_records(evidence_id: str) -> List[Dict[str, Any]]:
         results = []
         for r in rows:
             d = dict(r)
-            d["findings"] = json.loads(d["findings_json"] or "[]")
-            d["metadata_timeline"] = json.loads(d["metadata_timeline_json"] or "[]")
-            d["visual_evidence"] = json.loads(d["visual_evidence_json"] or "{}")
+            d["findings"] = _safe_parse_json(d.get("findings_json"), [])
+            d["metadata_timeline"] = _safe_parse_json(d.get("metadata_timeline_json"), [])
+            d["visual_evidence"] = _safe_parse_json(d.get("visual_evidence_json"), {})
+            d["analyzed_at"] = _format_timestamp(d.get("analyzed_at"))
             results.append(d)
         return results
 
@@ -790,13 +1070,14 @@ def get_audit_logs(
         results = []
         for r in rows:
             d = dict(r)
-            d["details"] = json.loads(d["details_json"] or "{}")
+            d["details"] = _safe_parse_json(d.get("details_json"), {})
+            d["timestamp"] = _format_timestamp(d.get("timestamp"))
             results.append(d)
         return results
 
 
 # ==============================================================================
-# Forensic Reports Persistence (Milestone E)
+# Forensic Reports Persistence
 # ==============================================================================
 
 def generate_report_id() -> str:
@@ -836,6 +1117,19 @@ def save_report_record(
     """
     now = _get_utc_now()
     records_json = json.dumps(included_records or [])
+    storage_bucket = BUCKET_ARTIFACTS
+    storage_path = f"{investigation_id}/{stored_filename}"
+
+    # Upload report to Supabase Storage if enabled
+    if is_supabase_storage_enabled():
+        report_file = REPORTS_DIR / stored_filename
+        if report_file.is_file():
+            upload_to_storage(
+                storage_bucket,
+                storage_path,
+                report_file.read_bytes(),
+                content_type="application/pdf",
+            )
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -844,8 +1138,8 @@ def save_report_record(
             INSERT INTO reports (
                 id, investigation_id, report_type, title, summary,
                 sha256, file_size_bytes, stored_filename, included_records_json,
-                generated_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                generated_by, created_at, storage_bucket, storage_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 report_id,
@@ -859,6 +1153,8 @@ def save_report_record(
                 records_json,
                 generated_by.strip(),
                 now,
+                storage_bucket,
+                storage_path,
             ),
         )
 
@@ -877,6 +1173,7 @@ def save_report_record(
                     "report_type": report_type,
                     "sha256": sha256_hash,
                     "records_count": len(included_records or []),
+                    "storage_path": storage_path,
                 }),
             ),
         )
@@ -901,7 +1198,8 @@ def get_report_by_id(report_id: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         d = dict(row)
-        d["included_records"] = json.loads(d["included_records_json"] or "[]")
+        d["included_records"] = _safe_parse_json(d.get("included_records_json"), [])
+        d["created_at"] = _format_timestamp(d.get("created_at"))
         return d
 
 
@@ -949,7 +1247,8 @@ def list_reports(
         reports = []
         for r in rows:
             d = dict(r)
-            d["included_records"] = json.loads(d["included_records_json"] or "[]")
+            d["included_records"] = _safe_parse_json(d.get("included_records_json"), [])
+            d["created_at"] = _format_timestamp(d.get("created_at"))
             reports.append(d)
 
         return {"reports": reports, "total": total}
@@ -958,7 +1257,6 @@ def list_reports(
 def get_report_file_path(report_id: str) -> Path:
     """
     Resolves the physical PDF report file path and validates directory traversal containment.
-    Raises FileNotFoundError if file is absent, PermissionError if traversal is attempted.
     """
     rec = get_report_by_id(report_id)
     if not rec:
@@ -976,7 +1274,14 @@ def get_report_file_path(report_id: str) -> Path:
         raise PermissionError("Attempted path traversal outside of reports vault.")
 
     if not file_path.exists():
+        # Ephemeral disk recovery: pull from Supabase Storage if available
+        if is_supabase_storage_enabled() and rec.get("storage_path"):
+            bucket = rec.get("storage_bucket") or BUCKET_ARTIFACTS
+            content = download_from_storage(bucket, rec["storage_path"])
+            if content:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_bytes(content)
+                return file_path
         raise FileNotFoundError(f"Physical report file does not exist at {file_path}")
 
     return file_path
-

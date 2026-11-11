@@ -58,7 +58,7 @@ export default function Settings() {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
           <div className="p-3.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
             <span className="text-[var(--text-muted)] block text-[10px] uppercase font-semibold">Service Endpoint</span>
-            <span className="text-[var(--text-primary)] font-semibold mt-1 block">http://127.0.0.1:8000</span>
+            <span className="text-[var(--text-primary)] font-semibold mt-1 block">{import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'}</span>
           </div>
           <div className="p-3.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-hairline)]">
             <span className="text-[var(--text-muted)] block text-[10px] uppercase font-semibold">API Version</span>
