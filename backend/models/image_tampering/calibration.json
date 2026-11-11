@@ -1,0 +1,8 @@
+{
+  "status": "uncalibrated",
+  "model_classification": "experimental",
+  "temperature": 1.0,
+  "threshold_low": 0.35,
+  "threshold_high": 0.65,
+  "notes": "Uncalibrated. Independent validation and test splits not established. Synthetic data prohibited."
+}

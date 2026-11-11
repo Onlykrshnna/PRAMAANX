@@ -1,0 +1,73 @@
+You are a senior backend engineer and forensic-tool designer. Fix the analysis logic and the verdict system of PRAMAANX (local image forensics tool). Keep the existing stack. Do not redesign the UI layout; only change the logic, the data it produces, and the copy. Work through the tasks in order and show a short diff summary for each.
+
+## CONTEXT
+- Pipeline: magic-byte check, byte distribution, EXIF check, ELA, EfficientNet-B0 (trained on CASIA 2.0), risk synthesis.
+- Observed bugs: the AI line shows "Low suspicion (NaN%)". A WhatsApp-forwarded, color-edited image got "No signs of editing found", same as the original. The Metadata tab shows the same 7 "absent" rows for every WhatsApp file. An authentic CASIA image (Au_ani_00001.jpg) scored 57% tampered.
+
+## TASK 1: FIX THE NaN BUG (highest priority)
+1. Find where model confidence is computed. Check for: missing softmax, division by zero, a tensor-to-float conversion failing, wrong input normalization or size, an empty or None output.
+2. Add validation: if the confidence is NaN, None, infinite, or outside 0..1, treat the model as FAILED.
+3. If the model fails, return `ai_status: "unavailable"` with a reason. The UI must show "AI screening unavailable" and must never show "Low suspicion" or a percentage.
+4. Add a unit test that feeds a normal JPEG, a tiny JPEG, a grayscale JPEG, and a PNG, and asserts the confidence is a finite float between 0 and 1 or the status is "unavailable".
+
+## TASK 2: ADD A "LIMITED EVIDENCE" VERDICT
+Replace the 3-state verdict with 4 states: `no_signs`, `limited_evidence`, `review_recommended`, `high_risk`.
+Return `limited_evidence` when ANY of these is true:
+- AI model status is unavailable
+- 5 or more of the 9 metadata fields are absent
+- Estimated JPEG quality is below 80
+- Long image side is 1600px or less AND EXIF is absent (likely messaging-app recompression)
+- Double-compression is detected
+`no_signs` is allowed ONLY when none of the above is true and every check passed.
+Copy for `limited_evidence`: "Limited evidence. This image was likely shared through a messaging app or recompressed, so edit-detection checks are less reliable. We cannot confirm it is authentic or edited."
+Never use the words "authentic", "unaltered", "real" or "fake" in any verdict. Replace "appears authentic and unaltered" with "no signs of localized editing detected".
+
+## TASK 3: FIX RISK SCORING
+1. Missing metadata must never add to the risk score. It only lowers the reliability.
+2. Add a second output field `reliability` (high / medium / low), derived from the Task 2 conditions.
+3. The UI shows ONE headline number (risk score) plus a small "Reliability: Low/Medium/High" line with a tooltip. Do not show model confidence as a second competing score.
+4. Do not let a single ML result alone push the score into High Risk. The ML signal is capped at 50 points.
+
+## TASK 4: REPLACE THE USELESS METADATA PANEL WITH JPEG STRUCTURE ANALYSIS
+Add a `jpeg_structure` analyzer (Pillow or a marker parser). Return these fields:
+- `estimated_quality` (0 to 100, estimated from the quantization tables, available in Pillow as `img.quantization`)
+- `quantization_tables_hash` (short hash for comparing files)
+- `chroma_subsampling` (4:2:0, 4:2:2, 4:4:4)
+- `encoding` (baseline or progressive)
+- `markers` (ordered list of APP/JFIF/Exif/ICC/Adobe markers present)
+- `bytes_per_pixel`
+- `long_side_px` and `aspect_ratio`
+- `double_compression_suspected` (boolean, using a simple histogram-periodicity check on DCT coefficients; if you cannot implement it reliably, return null and do not guess)
+- `likely_messaging_app_recompression` (boolean from the Task 2 rules)
+UI changes in the Metadata tab:
+- If 5 or more EXIF fields are absent, hide the list of absent rows by default. Show one card: "Original camera data is gone. This image was likely shared through a messaging app. Here is what we can still tell you:" followed by estimated quality, recompression level, and saving-software fingerprint.
+- Simple view: one line only ("Shared via messaging app, likely recompressed.").
+- Technical view: show the full table, marker order, and quantization hash.
+- Do not use the filename as evidence.
+
+## TASK 5: STATE THE SCOPE
+Under the verdict add one small line (info tooltip allowed): "Detects localized manipulation (splicing, object removal, copy-move). Global edits such as color filters or brightness changes cannot be reliably detected."
+
+## TASK 6: FIX ELA VISIBILITY
+Normalize the ELA map so it is not near-black: scale by the 99th percentile of the error, then apply a colormap (for example inferno). Show the scale factor in Technical view. If the image is heavily recompressed (Task 2), add the caption: "ELA is less reliable on recompressed images."
+
+## TASK 7: CALIBRATE THE MODEL (Au images flagged at 57%)
+1. Create an evaluation script that runs the model on a held-out set of authentic (Au) and tampered (Tp) CASIA images and prints accuracy, false-positive rate, and a confusion matrix.
+2. Apply temperature scaling or Platt scaling fitted on a validation split, and save the calibration parameters in the model config.
+3. Choose thresholds from the validation ROC (target false-positive rate under 5 percent). Set: below the low threshold = low suspicion, between = inconclusive, above the high threshold = elevated.
+4. Add a robustness test: re-save the test images with JPEG quality 70 and a resize to 1600px long side, and report how much accuracy drops. Output the numbers as a table for the project report.
+5. Label the model in the UI as "Beta model, trained on CASIA 2.0" with a tooltip stating its limits.
+
+## TASK 8: TEST FIXTURES
+Create `tests/fixtures/` with a script that generates variants of one input photo: original, quality-70 recompressed, resized to 1600px, EXIF-stripped. Add automated tests asserting:
+- The NaN case never reaches the UI.
+- A recompressed or stripped file returns `limited_evidence`, not `no_signs`.
+- Two different files produce different `jpeg_structure` values.
+- Missing metadata never raises the risk score.
+
+## DELIVERABLES
+1. The list of files changed, with a one-line reason for each.
+2. The updated verdict decision table (inputs to output).
+3. The updated API response schema (new fields: ai_status, reliability, jpeg_structure, verdict).
+4. The test results and the calibration metrics table.
+5. Do not remove existing fields. Anything new must be additive so the current UI keeps working.

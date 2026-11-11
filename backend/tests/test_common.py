@@ -463,10 +463,11 @@ def test_safe_extract_zip(tmp_path: Path):
 # ==============================================================================
 
 def test_pipeline_integration_benign_png(tmp_path: Path):
-    """Tests the complete end-to-end Phase 1 pipeline on a benign PNG."""
+    """Tests the complete end-to-end pipeline on a valid benign PNG."""
+    from PIL import Image
     png_path = tmp_path / "sample.png"
-    # Valid PNG header + benign data
-    png_path.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 100)
+    img = Image.new("RGB", (64, 64), color=(100, 150, 200))
+    img.save(png_path, format="PNG")
 
     pipeline = ForensicPipeline()
     result = pipeline.analyze_file(png_path, "sample.png")
@@ -492,4 +493,65 @@ def test_pipeline_integration_executable_spoof(tmp_path: Path):
     assert any("Disguise" in f.title or "Mismatch" in f.title for f in result.findings)
     assert result.risk_score >= 61
     assert result.risk_band == "High"
+
+
+def test_risk_score_deduplicates_correlated_findings():
+    """Duplicate/correlated findings with the same title are deduplicated to avoid score inflation."""
+    findings = [
+        Finding(title="Duplicate Finding", detail="D1", severity="medium", weight=0.40),
+        Finding(title="Duplicate Finding", detail="D2", severity="medium", weight=0.40),
+    ]
+    score, band = compute_risk_score(findings)
+    # If deduplicated, score is 40. If double-counted, score would be 64.
+    assert score == 40
+    assert band == "Medium"
+
+
+def test_pipeline_compressed_image_high_entropy_not_flagged(tmp_path: Path):
+    """High entropy in standard compressed images (JPEG/PNG) is expected and not flagged as a tamper anomaly."""
+    import os
+    from PIL import Image
+    # Create an image with high-frequency noise (high entropy)
+    jpg_path = tmp_path / "noise.jpg"
+    noise_bytes = os.urandom(256 * 256 * 3)
+    img = Image.frombytes("RGB", (256, 256), noise_bytes)
+    img.save(jpg_path, format="JPEG", quality=90)
+
+    pipeline = ForensicPipeline()
+    result = pipeline.analyze_file(jpg_path, "noise.jpg")
+
+    # High entropy should NOT create an "Anomalously High Shannon Entropy" finding for JPEG
+    entropy_findings = [f for f in result.findings if "High Shannon Entropy" in f.title]
+    assert len(entropy_findings) == 0
+
+
+def test_finding_taxonomy_categories_and_evidence():
+    """Verify Finding supports all 5 taxonomy categories and stores evidence properly."""
+    categories = ["structural", "statistical", "heuristic", "machine_learning", "inconclusive"]
+    for cat in categories:
+        f = Finding(
+            title=f"Test Finding {cat}",
+            detail="Detail",
+            severity="low",
+            weight=0.1,
+            evidence={"container_path": "test/path", "byte_offset": 128},
+            category=cat,
+        )
+        assert f.category == cat
+        assert f.evidence["container_path"] == "test/path"
+        assert f.evidence["byte_offset"] == 128
+
+
+def test_extension_mismatch_findings_have_structural_category():
+    """Extension mismatch and disguise findings must have category='structural'."""
+    from backend.analyzers.common import detect_magic_bytes
+    # MZ executable pretending to be PDF
+    mz_data = b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 100
+    detected = detect_magic_bytes(mz_data)
+    finding = check_extension_mismatch("invoice.pdf", detected)
+    assert finding is not None
+    assert finding.category == "structural"
+    assert "claimed_extension" in finding.evidence
+    assert "detected_mime" in finding.evidence
+
 

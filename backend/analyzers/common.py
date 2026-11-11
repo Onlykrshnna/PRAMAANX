@@ -99,6 +99,7 @@ class Finding(BaseModel):
     severity: Literal["low", "medium", "high"] = Field(..., description="Severity category")
     weight: float = Field(..., ge=0.0, le=1.0, description="Risk weight between 0.0 and 1.0")
     evidence: Dict[str, Any] = Field(default_factory=dict, description="Supporting forensic evidence")
+    category: Optional[str] = Field(default=None, description="Observation taxonomy: structural, statistical, heuristic, machine_learning, inconclusive")
 
     @field_validator("weight")
     @classmethod
@@ -130,8 +131,16 @@ class AnalysisResult(BaseModel):
     risk_band: Literal["Low", "Medium", "High"]
     findings: List[Finding]
     metadata_timeline: List[Dict[str, Any]] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     visual_evidence: Dict[str, str] = Field(default_factory=dict)
     plain_summary: str = ""
+    # New additive fields (Tasks 1, 2, 3, 4)
+    verdict: Literal["no_signs", "limited_evidence", "review_recommended", "high_risk"] = "no_signs"
+    verdict_copy: str = ""
+    reliability: Literal["high", "medium", "low"] = "high"
+    ai_status: str = "active"
+    ai_status_reason: Optional[str] = None
+    jpeg_structure: Optional[Dict[str, Any]] = None
 
 
 # ==============================================================================
@@ -400,7 +409,27 @@ def detect_magic_bytes(
             is_archive=False,
         )
 
-    # 3. PDF Check: '%PDF-' within the first 1024 bytes (per ISO 32000-1 spec)
+    # 3. BMP Check: starts with 'BM'
+    if header.startswith(b"BM"):
+        return MagicDetectionResult(
+            detected_mime="image/bmp",
+            detected_ext=".bmp",
+            description="Bitmap Image (BMP)",
+            is_supported=True,
+            is_archive=False,
+        )
+
+    # 4. TIFF Check: starts with 'II*\x00' (Little Endian) or 'MM\x00*' (Big Endian)
+    if header.startswith(b"II*\x00") or header.startswith(b"MM\x00*"):
+        return MagicDetectionResult(
+            detected_mime="image/tiff",
+            detected_ext=".tiff",
+            description="Tagged Image File Format (TIFF)",
+            is_supported=True,
+            is_archive=False,
+        )
+
+    # 5. PDF Check: '%PDF-' within the first 1024 bytes (per ISO 32000-1 spec)
     if PDF_SIG in header[:1024]:
         return MagicDetectionResult(
             detected_mime="application/pdf",
@@ -410,7 +439,7 @@ def detect_magic_bytes(
             is_archive=False,
         )
 
-    # 4. ZIP or OpenXML Office Check: starts with PK\x03\x04, PK\x05\x06, or PK\x07\x08
+    # 6. ZIP or OpenXML Office Check: starts with PK\x03\x04, PK\x05\x06, or PK\x07\x08
     if header.startswith(ZIP_SIG) or header.startswith(ZIP_EMPTY_SIG) or header.startswith(ZIP_SPANNED_SIG):
         mime, ext, desc = _inspect_openxml_archive(file_source)
         return MagicDetectionResult(
@@ -421,13 +450,13 @@ def detect_magic_bytes(
             is_archive=True,
         )
 
-    # 5. Legacy OLE CFBF Check: \xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 (Old DOC/XLS/PPT 97-2003)
+    # 7. Legacy OLE CFBF Check: \xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 (Old DOC/XLS/PPT 97-2003)
     if header.startswith(OLE_CFBF_SIG):
         return MagicDetectionResult(
             detected_mime="application/x-ole-storage",
             detected_ext=".ole",
             description="Legacy Microsoft Compound File Binary Format (OLE CFBF)",
-            is_supported=False,
+            is_supported=True,
             is_archive=False,
         )
 
@@ -487,9 +516,18 @@ def check_extension_mismatch(
     """
     declared_ext = Path(filename).suffix.lower()
 
-    # Normalization: .jpeg and .jpg are functionally equivalent
+    # Normalization: .jpeg/.jpg and .tiff/.tif are functionally equivalent
     normalized_declared = ".jpg" if declared_ext == ".jpeg" else declared_ext
     normalized_detected = ".jpg" if detected.detected_ext == ".jpeg" else detected.detected_ext
+
+    if normalized_declared == ".tif":
+        normalized_declared = ".tiff"
+    if normalized_detected == ".tif":
+        normalized_detected = ".tiff"
+
+    # Legacy Office normalization (.doc, .xls, .ppt contain .ole storage)
+    if normalized_declared in (".doc", ".xls", ".ppt") and normalized_detected == ".ole":
+        normalized_detected = normalized_declared
 
     # If file has no extension at all
     if not declared_ext:
@@ -503,6 +541,7 @@ def check_extension_mismatch(
                 "detected_mime": detected.detected_mime,
                 "detected_extension": detected.detected_ext,
             },
+            category="inconclusive",
         )
 
     # If declared is supported, but magic bytes indicate something completely different
@@ -523,6 +562,7 @@ def check_extension_mismatch(
                     "detected_mime": detected.detected_mime,
                     "detected_extension": detected.detected_ext,
                 },
+                category="structural",
             )
 
         # High-severity case: One document format disguised as another (e.g. PDF claiming to be JPG)
@@ -540,6 +580,7 @@ def check_extension_mismatch(
                 "detected_mime": detected.detected_mime,
                 "detected_extension": detected.detected_ext,
             },
+            category="structural",
         )
 
     return None
@@ -579,13 +620,48 @@ def compute_risk_score(findings: List[Finding]) -> Tuple[int, Literal["Low", "Me
     if not findings:
         return (0, "Low")
 
+    # Deduplicate findings by title to prevent double-counting correlated findings
+    seen_titles = set()
     product_no_tamper = 1.0
+    has_non_ml_tamper_findings = False
+
     for finding in findings:
+        title_key = finding.title.strip().lower()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        # Task 3: Missing metadata must NEVER add to the risk score (it only lowers reliability)
+        if (
+            finding.category == "inconclusive"
+            or "stripped" in title_key
+            or "missing metadata" in title_key
+            or "absent metadata" in title_key
+        ):
+            continue
+
         w = max(0.0, min(1.0, float(finding.weight)))
+
+        # Task 3: Do not let a single ML result alone push the score into High Risk.
+        # The ML signal is capped at 50 points (weight <= 0.50).
+        is_ml = (
+            finding.category == "machine_learning"
+            or "machine learning" in title_key
+            or "efficientnet" in title_key
+        )
+        if is_ml:
+            w = min(0.50, w)
+        elif w > 0:
+            has_non_ml_tamper_findings = True
+
         product_no_tamper *= (1.0 - w)
 
     raw_score = (1.0 - product_no_tamper) * 100.0
     risk_score = int(round(raw_score))
+
+    # Task 3: If only ML findings exist, cap total score strictly at 50 points
+    if not has_non_ml_tamper_findings:
+        risk_score = min(50, risk_score)
 
     # Clamp safely to [0, 100]
     risk_score = max(0, min(100, risk_score))
@@ -599,6 +675,113 @@ def compute_risk_score(findings: List[Finding]) -> Tuple[int, Literal["Low", "Me
         risk_band = "High"
 
     return (risk_score, risk_band)
+
+
+def determine_verdict_and_reliability(
+    risk_score: int,
+    risk_band: Literal["Low", "Medium", "High"],
+    findings: List[Finding],
+    detected_mime: str,
+    metadata: Dict[str, Any],
+    ai_status: str = "active",
+    jpeg_structure: Optional[Dict[str, Any]] = None,
+) -> Tuple[Literal["no_signs", "limited_evidence", "review_recommended", "high_risk"], str, Literal["high", "medium", "low"]]:
+    """
+    Evaluates specimen reliability and assigns one of 4 standardized verdicts:
+    - `high_risk`
+    - `review_recommended`
+    - `limited_evidence`
+    - `no_signs` (ALLOWED ONLY when no limited-evidence conditions exist and all checks passed)
+
+    Scientific Rules:
+    - Never uses words 'authentic', 'unaltered', 'real', or 'fake'.
+    - Returns `limited_evidence` when specimen exhibits recompression, missing camera metadata,
+      low JPEG quality (<80), small dimensions (<=1600px without EXIF), double-compression,
+      or unavailable AI screening.
+    """
+    is_image = detected_mime.startswith("image/")
+
+    # 1. Evaluate degradation conditions (Task 2)
+    degradations = []
+
+    if is_image:
+        # C1: AI screening status is unavailable
+        if ai_status == "unavailable":
+            degradations.append("ai_unavailable")
+
+        # C2: 5 or more of the 9 metadata fields are absent
+        # Check from jpeg_structure indicators or metadata fields
+        absent_meta_count = 0
+        if jpeg_structure and "recompression_indicators" in jpeg_structure:
+            if jpeg_structure["recompression_indicators"].get("stripped_camera_metadata"):
+                degradations.append("metadata_stripped")
+        else:
+            # Fallback direct count of 9 standard fields
+            meta_checks = [
+                bool(metadata.get("camera_make") or metadata.get("camera_model") or metadata.get("Make")),
+                bool(metadata.get("datetime_original") or metadata.get("DateTimeOriginal")),
+                bool(metadata.get("datetime_digitized") or metadata.get("DateTimeDigitized")),
+                bool(metadata.get("datetime") or metadata.get("DateTime")),
+                bool(metadata.get("gps_coordinates") or metadata.get("GPSCoordinates")),
+                bool(metadata.get("width") and metadata.get("height")),
+                bool(metadata.get("orientation") or metadata.get("Orientation")),
+                bool(metadata.get("software") or metadata.get("Software")),
+                bool(metadata.get("has_icc_profile") or metadata.get("color_space")),
+            ]
+            absent_meta_count = sum(1 for present in meta_checks if not present)
+            if absent_meta_count >= 5:
+                degradations.append("metadata_stripped")
+
+        # C3: Estimated JPEG quality is below 80
+        if jpeg_structure and jpeg_structure.get("estimated_quality") is not None:
+            if jpeg_structure["estimated_quality"] < 80:
+                degradations.append("low_quality_recompression")
+
+        # C4: Long image side is 1600px or less AND EXIF is absent
+        if jpeg_structure and "recompression_indicators" in jpeg_structure:
+            if jpeg_structure["recompression_indicators"].get("messaging_resolution_limit"):
+                degradations.append("messaging_resize_no_exif")
+        else:
+            w = metadata.get("width", 0) or 0
+            h = metadata.get("height", 0) or 0
+            has_exif = bool(metadata.get("camera_make") or metadata.get("software") or metadata.get("exif_fields"))
+            if max(w, h) <= 1600 and not has_exif and max(w, h) > 0:
+                degradations.append("messaging_resize_no_exif")
+
+        # C5: Double compression detected
+        if jpeg_structure and jpeg_structure.get("double_compression_suspected") is True:
+            degradations.append("double_compression")
+
+    # 2. Derive Reliability (Task 3)
+    if len(degradations) >= 2:
+        reliability: Literal["high", "medium", "low"] = "low"
+    elif len(degradations) == 1:
+        reliability = "medium"
+    else:
+        reliability = "high"
+
+    # 3. Derive 4-State Verdict (Task 2)
+    has_high_findings = any(f.severity == "high" for f in findings if f.category != "inconclusive")
+    has_med_findings = any(f.severity == "medium" for f in findings if f.category != "inconclusive")
+
+    if risk_score > 60 or has_high_findings:
+        verdict: Literal["no_signs", "limited_evidence", "review_recommended", "high_risk"] = "high_risk"
+        verdict_copy = "High risk of editing detected. Strong indicators of manipulation or structural tampering were identified."
+    elif risk_score > 30 or has_med_findings:
+        verdict = "review_recommended"
+        verdict_copy = "Review recommended. Anomalies were detected that warrant manual verification."
+    elif len(degradations) > 0:
+        verdict = "limited_evidence"
+        verdict_copy = (
+            "Limited evidence. This image was likely shared through a messaging app or recompressed, "
+            "so edit-detection checks are less reliable. We cannot confirm it is authentic or edited."
+        )
+    else:
+        # no_signs is allowed ONLY when none of the above is true and every check passed
+        verdict = "no_signs"
+        verdict_copy = "No signs of localized editing detected."
+
+    return (verdict, verdict_copy, reliability)
 
 
 # ==============================================================================
@@ -655,6 +838,7 @@ def validate_zip_safety(
                 severity="high",
                 weight=0.90,
                 evidence={"error": str(e)},
+                category="inconclusive",
             )
         )
         return (False, findings, [])
@@ -675,6 +859,7 @@ def validate_zip_safety(
                     severity="high",
                     weight=0.90,
                     evidence={"entry_count": entry_count, "max_allowed": MAX_ZIP_ENTRIES},
+                    category="structural",
                 )
             )
             return (False, findings, [])
@@ -704,7 +889,8 @@ def validate_zip_safety(
                         ),
                         severity="high",
                         weight=1.0,
-                        evidence={"malicious_entry": filename},
+                        evidence={"malicious_entry": filename, "container_path": filename},
+                        category="structural",
                     )
                 )
                 return (False, findings, [])
@@ -722,7 +908,8 @@ def validate_zip_safety(
                         ),
                         severity="high",
                         weight=0.95,
-                        evidence={"symlink_entry": filename},
+                        evidence={"symlink_entry": filename, "container_path": filename},
+                        category="structural",
                     )
                 )
                 return (False, findings, [])
@@ -746,10 +933,12 @@ def validate_zip_safety(
                             weight=0.85,
                             evidence={
                                 "entry": filename,
+                                "container_path": filename,
                                 "uncompressed_bytes": member.file_size,
                                 "compressed_bytes": member.compress_size,
                                 "compression_ratio": round(entry_ratio, 2),
                             },
+                            category="statistical",
                         )
                     )
 
@@ -765,7 +954,8 @@ def validate_zip_safety(
                         ),
                         severity="high",
                         weight=0.95,
-                        evidence={"dangerous_entry": filename, "extension": member_suffix},
+                        evidence={"dangerous_entry": filename, "extension": member_suffix, "container_path": filename},
+                        category="structural",
                     )
                 )
 
@@ -788,6 +978,7 @@ def validate_zip_safety(
                         "total_uncompressed_bytes": total_uncompressed_bytes,
                         "max_allowed_bytes": MAX_ZIP_UNCOMPRESSED_BYTES,
                     },
+                    category="statistical",
                 )
             )
             return (False, findings, [])
