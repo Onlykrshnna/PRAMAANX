@@ -25,11 +25,11 @@ exifread>=3.0.0
 oletools>=0.60.1
 reportlab>=4.1.0
 
-# Machine Learning & Scientific Computing (Local Self-Owned Models)
+# Machine Learning & Scientific Computing (CPU-Optimized, Self-Owned Models)
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.2.0
 torchvision>=0.17.0
 xgboost>=2.0.0
-scikit-learn>=1.4.0
 
 # Testing
 pytest>=8.0.0

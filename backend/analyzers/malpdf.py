@@ -29,7 +29,7 @@ import pymupdf
 from backend.analyzers.common import Finding, compute_shannon_entropy
 
 
-MODEL_PATH: Path = Path(__file__).resolve().parent.parent / "models" / "malpdf_xgb.json"
+from backend.config import PDF_XGB_MODEL_PATH as MODEL_PATH
 
 
 @dataclass

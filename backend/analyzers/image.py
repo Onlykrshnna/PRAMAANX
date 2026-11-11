@@ -37,28 +37,37 @@ import shutil
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 from PIL import Image, ImageChops, ImageEnhance, ExifTags
-import torch
-import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
 
-from backend.config import MAX_UPLOAD_SIZE_BYTES, UPLOAD_TEMP_DIR
+from backend.config import (
+    IMAGE_CALIBRATION_PATH as CALIBRATION_PATH,
+    IMAGE_MODEL_PATH as MODEL_PATH,
+    MAX_UPLOAD_SIZE_BYTES,
+    UPLOAD_TEMP_DIR,
+)
 from backend.analyzers.common import Finding, compute_sha256
 from backend.analyzers.jpeg_structure import analyze_jpeg_structure
+
+# Lazy OpenCV accessor
+_cv2 = None
+
+
+def _get_cv2():
+    """Lazily imports and caches cv2 to avoid startup memory consumption."""
+    global _cv2
+    if _cv2 is None:
+        import cv2
+        _cv2 = cv2
+    return _cv2
 
 
 # ==============================================================================
 # Model Configuration, Calibration & Singleton Management
 # ==============================================================================
 
-MODEL_PATH: Path = Path(__file__).resolve().parent.parent / "models" / "image_tampering" / "pramaanx_efficientnet_best.pth"
-CALIBRATION_PATH: Path = Path(__file__).resolve().parent.parent / "models" / "image_tampering" / "calibration.json"
-
 _MODEL_LOCK = threading.Lock()
-_IMAGE_MODEL: Optional[nn.Module] = None
+_IMAGE_MODEL: Optional[Any] = None
 _MODEL_METADATA: Dict[str, Any] = {}
 
 
@@ -92,10 +101,10 @@ def get_calibration_params() -> Dict[str, Any]:
     return default_params
 
 
-def get_tamper_model() -> Tuple[nn.Module, Dict[str, Any]]:
+def get_tamper_model() -> Tuple[Any, Dict[str, Any]]:
     """
     Thread-safe singleton loader for the trained EfficientNet-B0 tampering model.
-    Loads the model into memory exactly once.
+    Loads the model into memory exactly once onto CPU.
     """
     global _IMAGE_MODEL, _MODEL_METADATA
 
@@ -113,7 +122,19 @@ def get_tamper_model() -> Tuple[nn.Module, Dict[str, Any]]:
                 "Please place the authentic CASIA 2.0 trained checkpoint at this path."
             )
 
-        # Load checkpoint onto CPU (device-agnostic)
+        import torch
+        import torch.nn as nn
+        import torchvision.models as models
+
+        # Constrain CPU thread pool allocation on constrained memory hosts (e.g. Render 512MB)
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+
+        # Load checkpoint onto CPU (device-agnostic, zero CUDA footprint)
         checkpoint = torch.load(MODEL_PATH, map_location="cpu")
 
         # Instantiate EfficientNet-B0 architecture
@@ -125,6 +146,7 @@ def get_tamper_model() -> Tuple[nn.Module, Dict[str, Any]]:
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state_dict)
         model.eval()
+        model.to("cpu")
 
         _IMAGE_MODEL = model
         _MODEL_METADATA = {
@@ -140,15 +162,31 @@ def get_tamper_model() -> Tuple[nn.Module, Dict[str, Any]]:
         return _IMAGE_MODEL, _MODEL_METADATA
 
 
-# Preprocessing pipeline matching CASIA 2.0 training
-IMAGE_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
-])
+# Preprocessing pipeline matching CASIA 2.0 training (Lazy initialized)
+_IMAGE_TRANSFORM = None
+
+
+def get_image_transform():
+    """Lazily initializes the standardized ImageNet normalization pipeline."""
+    global _IMAGE_TRANSFORM
+    if _IMAGE_TRANSFORM is None:
+        import torchvision.transforms as transforms
+        _IMAGE_TRANSFORM = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+    return _IMAGE_TRANSFORM
+
+
+def __getattr__(name: str) -> Any:
+    """Module-level attribute fallback for lazy-loaded objects."""
+    if name == "IMAGE_TRANSFORM":
+        return get_image_transform()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ==============================================================================
@@ -181,11 +219,11 @@ class GradCAM:
     Targets the final convolutional block (model.features[-1]).
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: Any):
         self.model = model
         self.target_layer = model.features[-1]
-        self.activations: Optional[torch.Tensor] = None
-        self.gradients: Optional[torch.Tensor] = None
+        self.activations: Optional[Any] = None
+        self.gradients: Optional[Any] = None
         self.handles: List[Any] = []
         self._register_hooks()
 
@@ -201,13 +239,16 @@ class GradCAM:
 
     def generate_heatmap(
         self,
-        input_tensor: torch.Tensor,
+        input_tensor: Any,
         target_class: int = 1,  # Target class 1: Tampered
     ) -> np.ndarray:
         """
         Computes the normalized Grad-CAM activation heatmap for target class.
         Returns 2D float numpy array in [0.0, 1.0].
         """
+        import torch
+        import torch.nn as nn
+
         self.model.zero_grad()
         output = self.model(input_tensor)
         score = output[0, target_class]
@@ -247,8 +288,8 @@ class GradCAM:
 
 def generate_gradcam_overlay(
     image: Image.Image,
-    model: nn.Module,
-    input_tensor: torch.Tensor,
+    model: Any,
+    input_tensor: Any,
     output_path: Path,
     target_class: int = 1,
 ) -> Path:
@@ -266,6 +307,7 @@ def generate_gradcam_overlay(
         orig_w, orig_h = orig_img.size
         orig_np = np.array(orig_img)
 
+        cv2 = _get_cv2()
         # Apply JET colormap via OpenCV
         heatmap_uint8 = np.uint8(255 * heatmap_2d)
         heatmap_colored_bgr = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
@@ -333,6 +375,7 @@ def compute_ela(
     scaled_error = np.clip(error_mag * scale_factor, 0, 255).astype(np.uint8)
 
     # Apply Inferno colormap
+    cv2 = _get_cv2()
     colormap_bgr = cv2.applyColorMap(scaled_error, cv2.COLORMAP_INFERNO)
     colormap_rgb = cv2.cvtColor(colormap_bgr, cv2.COLOR_BGR2RGB)
 
@@ -699,6 +742,7 @@ def analyze_image(
 
             # 4. Deep Learning Tampering Inference (EfficientNet-B0)
             try:
+                import torch
                 model, meta = get_tamper_model()
                 calib = get_calibration_params()
                 temp = calib["temperature"]
@@ -706,9 +750,10 @@ def analyze_image(
                 th_high = calib["threshold_high"]
 
                 img_rgb = img.convert("RGB")
-                input_tensor = IMAGE_TRANSFORM(img_rgb).unsqueeze(0)
+                transform = get_image_transform()
+                input_tensor = transform(img_rgb).unsqueeze(0)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits = model(input_tensor)
 
                 # Task 1 Validation: Check if logits is None, NaN, or Inf

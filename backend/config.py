@@ -120,6 +120,9 @@ RISK_BAND_HIGH_MAX: int = 100
 # ==============================================================================
 BASE_DIR: Path = Path(__file__).resolve().parent
 MODELS_DIR: Path = BASE_DIR / "models"
+IMAGE_MODEL_PATH: Path = MODELS_DIR / "image_tampering" / "pramaanx_efficientnet_best.pth"
+IMAGE_CALIBRATION_PATH: Path = MODELS_DIR / "image_tampering" / "calibration.json"
+PDF_XGB_MODEL_PATH: Path = MODELS_DIR / "malpdf_xgb.json"
 
 # Safe temporary directory for processing untrusted uploads
 # Uses OS temporary folder or configured environment variable

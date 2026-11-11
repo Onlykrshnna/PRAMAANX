@@ -57,8 +57,7 @@ from backend.analyzers.common import (
     safe_extract_zip,
     validate_zip_safety,
 )
-from backend.analyzers.image import MODEL_PATH as IMAGE_MODEL_PATH
-from backend.analyzers.malpdf import MODEL_PATH as PDF_XGB_MODEL_PATH
+from backend.config import IMAGE_MODEL_PATH, PDF_XGB_MODEL_PATH
 from backend.database import check_db_health, init_db
 from backend.pipeline import ForensicPipeline
 from backend.routes.investigations import router as investigations_router
